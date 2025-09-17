@@ -1,0 +1,23 @@
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments and local tooling
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+
+# Build artifacts
+build/
+dist/
+
+# Generated log output
+logs/
+bugreports/
+
+# macOS metadata
+.DS_Store
