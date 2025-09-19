@@ -38,6 +38,65 @@ BT_KEYWORDS = [
     "gatt timeout",
 ]
 
+GATT_CONGESTION_STATUS_RE = re.compile(r"status\s*[:=]\s*(142|0x8e)", re.IGNORECASE)
+
+
+class BugreportController:
+    def __init__(self, initial: bool):
+        self._enabled = initial
+        self._lock = threading.Lock()
+
+    def set_enabled(self, value: bool) -> None:
+        with self._lock:
+            self._enabled = value
+
+    def is_enabled(self) -> bool:
+        with self._lock:
+            return self._enabled
+
+
+class BugreportCLIControl(threading.Thread):
+    def __init__(self, controller: BugreportController):
+        super().__init__(daemon=True)
+        self.controller = controller
+
+    def run(self) -> None:
+        sys.stderr.write("[bugreport-ui] Commands: on/off/toggle/status/quit\n")
+        sys.stderr.flush()
+        while True:
+            try:
+                sys.stderr.write("[bugreport-ui] > ")
+                sys.stderr.flush()
+                cmd = sys.stdin.readline()
+            except Exception:
+                break
+            if not cmd:
+                break
+            cmd = cmd.strip().lower()
+            if not cmd:
+                continue
+            if cmd in {"on", "enable"}:
+                self.controller.set_enabled(True)
+                sys.stderr.write("[bugreport-ui] bugreport enabled\n")
+            elif cmd in {"off", "disable"}:
+                self.controller.set_enabled(False)
+                sys.stderr.write("[bugreport-ui] bugreport disabled\n")
+            elif cmd in {"toggle", "switch"}:
+                current = self.controller.is_enabled()
+                self.controller.set_enabled(not current)
+                state = "enabled" if not current else "disabled"
+                sys.stderr.write(f"[bugreport-ui] bugreport {state}\n")
+            elif cmd in {"status", "state"}:
+                state = "enabled" if self.controller.is_enabled() else "disabled"
+                sys.stderr.write(f"[bugreport-ui] bugreport currently {state}\n")
+            elif cmd in {"quit", "exit"}:
+                sys.stderr.write("[bugreport-ui] closing control interface\n")
+                sys.stderr.flush()
+                break
+            else:
+                sys.stderr.write("[bugreport-ui] unknown command\n")
+            sys.stderr.flush()
+
 
 def parse_logcat_line(line: str):
     m = LINE_RE.match(line.strip())
@@ -204,7 +263,11 @@ def run(args):
     cleaner.start()
 
     # bugreport trigger control
-    enable_bugreport = not getattr(args, "no_bugreport", False)
+    bugreport_controller = BugreportController(not getattr(args, "no_bugreport", False))
+    bugreport_ui_thread = None
+    if getattr(args, "bugreport_ui", False):
+        bugreport_ui_thread = BugreportCLIControl(bugreport_controller)
+        bugreport_ui_thread.start()
     bug_dir = out_dir / "bugreports"
     bug_dir.mkdir(parents=True, exist_ok=True)
     last_bugreport_time = 0.0
@@ -213,7 +276,7 @@ def run(args):
 
     # Original generic BT issue detector (additive; not changing other logic)
     def should_trigger_bt_issue(rec: dict, raw_line: str) -> bool:
-        if not enable_bugreport:
+        if not bugreport_controller.is_enabled():
             return False
         lvl = (rec.get("level") or "").upper()
         tag = (rec.get("tag") or "").strip()
@@ -262,6 +325,21 @@ def run(args):
                 return True
             if "gatt_utils.cc" in raw and "timed out" in raw and "service changed" in raw:
                 return True
+        except Exception:
+            pass
+        return False
+
+    def _is_gatt_congestion_event(rec: dict, raw_line: str) -> bool:
+        try:
+            msg = (rec.get("message") or "").lower()
+            raw = (raw_line or "").lower()
+            if "bta_gattc_cmpl_cback" in raw or "bta_gattc_cmpl_cback" in msg:
+                if GATT_CONGESTION_STATUS_RE.search(raw) or GATT_CONGESTION_STATUS_RE.search(msg):
+                    return True
+                if "gatt_congested" in raw or "gatt_congested" in msg:
+                    return True
+                if "gatt_busy" in raw or "gatt_busy" in msg:
+                    return True
         except Exception:
             pass
         return False
@@ -356,6 +434,8 @@ def run(args):
                     "message": line.strip(),
                 }
 
+            bug_enabled = bugreport_controller.is_enabled()
+
             # Check previous-minute tail line for onNotify trigger
             try:
                 cur_key = _minute_key(rec["timestamp"])
@@ -364,7 +444,7 @@ def run(args):
                 elif cur_key != prev_min_key and prev_rec is not None:
                     if _is_bt_notify(prev_rec, prev_line):
                         now_t = time.time()
-                        if enable_bugreport and (now_t - last_bugreport_time >= args.bugreport_cooldown):
+                        if bug_enabled and (now_t - last_bugreport_time >= args.bugreport_cooldown):
                             trigger_bugreport_async()
                     prev_min_key = cur_key
             except Exception:
@@ -374,7 +454,7 @@ def run(args):
             rotator.write_row(rec)
 
             # trigger only on GATT Service Changed indication timeout
-            if enable_bugreport:
+            if bug_enabled:
                 try:
                     if _is_gatt_service_changed_timeout(rec, line):
                         now_t = time.time()
@@ -382,9 +462,19 @@ def run(args):
                             trigger_bugreport_async()
                 except Exception:
                     pass
+
+            # Trigger when bta_gattc callback reports congestion/busy status
+            if bug_enabled:
+                try:
+                    if _is_gatt_congestion_event(rec, line):
+                        now_t = time.time()
+                        if now_t - last_bugreport_time >= args.bugreport_cooldown:
+                            trigger_bugreport_async()
+                except Exception:
+                    pass
             
             # Also keep original generic BT error trigger
-            if enable_bugreport:
+            if bug_enabled:
                 try:
                     if should_trigger_bt_issue(rec, line):
                         now_t = time.time()
@@ -409,6 +499,11 @@ def main():
     parser.add_argument("--retention", type=int, default=36, help="Retention hours for logs (default: 36)")
     parser.add_argument("--no-bugreport", action="store_true", help="Disable automatic bugreport trigger")
     parser.add_argument("--bugreport-cooldown", type=int, default=900, help="Cooldown seconds between bugreports (default: 900)")
+    parser.add_argument(
+        "--bugreport-ui",
+        action="store_true",
+        help="Launch simple CLI UI to control bugreport toggling at runtime",
+    )
     args = parser.parse_args()
     run(args)
 
