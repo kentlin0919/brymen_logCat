@@ -1,36 +1,90 @@
-# Brymen LogCat Rotator
+# logcat_rotate
 
-## Overview
-`logcat_rotate.py` streams Android `adb logcat` output, mirrors each line to stdout, and persists parsed entries as minute-sliced CSV files. Bluetooth GATT errors are highlighted: when qualifying timeouts or crashes appear, the tool can trigger `adb bugreport` to capture a diagnostic snapshot. A background janitor prunes aged CSVs and bug reports, keeping disk consumption predictable during long test runs.
+以藍牙（Bluetooth）相關訊息為重點，從 Android `logcat` 擷取並持續寫入 CSV，按分鐘輪轉檔案，並依保留期自動清除舊資料。輸出以每 5 分鐘為一個目錄群組，內含逐分鐘的 CSV；可選擇輸出 `bugreports/` 壓縮檔以利問題回報。若加上 `--no-bugreport`，將完全停用 bugreport 匯出。
 
-## Prerequisites
-- Python 3.8+ with standard library only; no third-party modules are required.
-- Android SDK platform tools (`adb`) available on `PATH`, with a connected and authorized device or emulator.
-- Sufficient disk quota for rolling CSVs and optional bugreport ZIPs in the chosen output directory.
+## 功能特色
+- 針對藍牙相關 Tag 過濾：聚焦 BT 訊息（例如模組內的 `BT_TAGS`）。
+- 分鐘級 CSV 輪轉：每分鐘自動產出一個 CSV，避免單檔過大。
+- 五分鐘目錄分組：輸出路徑下以 5 分鐘為單位建立資料夾便於整理與查找。
+- 保留期清理：依設定的保留期自動刪除過期的目錄/檔案，控制磁碟用量。
+- 可選 `bugreports/`：在需要時輸出裝置 bugreport ZIP 以輔助除錯（若腳本開啟該模式）。
 
-## Quick Start
-```bash
-python3 logcat_rotate.py --dir ./logs --prefix bt --retention 36
-```
-- `--dir` sets the base folder for generated artifacts (defaults to `./logs`).
-- `--prefix` controls the CSV filename prefix, helping segment different capture sessions.
-- `--retention` keeps artifacts for the provided number of hours; older CSV/TXT/ZIP files are removed.
-- Add `--no-bugreport` to disable automatic bugreport capture, or tweak `--bugreport-cooldown` (seconds) to widen the interval between successive reports.
+## 需求
+- Python 3（建議 3.8+）
+- 已安裝並可從 `PATH` 呼叫的 `adb`
+- 至少一台已授權的 Android 裝置（`adb devices` 可見且為 authorized）
 
-## Output Layout
-- CSV files are organized into five-minute buckets (e.g., `logs/2024-09-17_10-15/bt_2024-09-17_10-16.csv`). Each CSV records timestamp, PID, TID, log level, tag, and message.
-- When bugreport capture is enabled, ZIPs land in `logs/bugreports/bugreport_<timestamp>.zip`.
-- The tool echoes every line to stdout so existing log pipelines remain compatible.
+## 快速開始
+1. 檢視可用參數與預設值：
+   ```bash
+   python3 logcat_rotate.py --help
+   ```
+2. 本機執行並輸出到 `./logs`，檔名前綴為 `bt`，保留期 36（單位視程式而定，常見為小時）：
+   ```bash
+   python3 logcat_rotate.py --dir ./logs --prefix bt --retention 36
+   # 停用 bugreport 匯出：
+   python3 logcat_rotate.py --dir ./logs --prefix bt --retention 36 --no-bugreport
+   ```
+3. 執行前請確認：
+   - `adb` 可連線且裝置時間精度符合需求（見下方「裝置與時間精度」）。
+   - 目錄可寫入，並監控磁碟空間（長時間執行時尤需留意）。
 
-## Operational Notes
-- Device timestamps must include milliseconds. Validate with `adb shell 'date "+%Y-%m-%d %H:%M:%S.%3N"'`; if `%N` is unsupported, the script gracefully falls back to whole milliseconds.
-- Graceful shutdown (Ctrl+C) ensures open CSV handles are flushed and `adb logcat` is terminated.
-- Long-lived sessions benefit from monitoring free space; adjust `--retention` or rotate logs externally as needed.
+## 輸出結構
+- 根輸出目錄：由 `--dir` 指定，例如 `./logs`
+- 五分鐘群組資料夾：例如 `2024-05-01_13-25/`（13:25–13:29 之間的分鐘 CSV）
+- 分鐘級 CSV：每分鐘一檔，檔名通常包含前綴與分鐘時間戳（如 `bt_20240501_1325.csv`）
+- 可選 `bugreports/`：當啟用 bugreport 匯出時，會在群組資料夾下建立 ZIP 檔
 
-## Contributing
-See `AGENTS.md` for coding standards, testing expectations, and pull request guidance tailored to this repository.
+> CSV 欄位以腳本實作為準；通常會包含時間戳、層級、Tag 與訊息等。每一列對應一行 `logcat` 訊息（經過 `parse_logcat_line` 類的解析）。
 
+## 常用參數
+- `--dir`：輸出根目錄
+- `--prefix`：輸出檔名前綴（例如 `bt`）
+- `--retention`：保留期（單位依腳本實作，常見為「小時」）；超過者自動清除
+- `--no-bugreport`：禁止輸出 bugreport（即使預設情境會產生 bugreport，也強制停用）
+- 其餘旗標與細節請執行：
+  ```bash
+  python3 logcat_rotate.py --help
+  ```
 
-## git
-- 使用繁體中文撰寫commit
-- 自動git push
+## 裝置與時間精度
+- 先確認裝置時間可提供毫秒精度：
+  ```bash
+  adb shell 'date "+%Y-%m-%d %H:%M:%S.%3N"'
+  ```
+  若 `%N` 不支援，請在執行收集器前降級為以整數毫秒處理，避免解析錯誤或時間對不齊。
+- 長時間執行時請監控輸出目錄的磁碟用量；必要時提高 `--retention` 清理頻率、或以排程搭配額外清理。
+
+## 開發與測試
+- 程式風格：遵循 PEP 8；模組常數使用 UPPER_SNAKE_CASE（如 `BT_TAGS`），函式命名使用 `lowercase_with_underscores`；保留並補齊型別註解。
+- 語法快查：
+  ```bash
+  python3 -m compileall .
+  ```
+- 單元測試：建議以 `pytest` 或 `unittest` 放在 `tests/` 目錄（例如 `tests/test_logcat_rotate.py`）。
+  - 優先針對可決定性的工具函式與流程測：`parse_logcat_line`、輪轉邊界、保留期清理等；
+  - 執行方式：
+    ```bash
+    pytest
+    # 或
+    python3 -m unittest discover
+    ```
+
+## 疑難排解
+- `adb` 連線問題：
+  - 確認 `adb devices` 可看到裝置且為 `device`（非 `unauthorized`/`offline`）。
+  - 重新插拔資料線、開啟 USB 偵錯、確認授權對話框。
+- CSV 未產出或無 BT 訊息：
+  - 檢查當前過濾的 Tag 是否覆蓋到預期模組。
+  - 放寬過濾或暫時全量收集以定位來源。
+- 磁碟快速膨脹：
+  - 降低 `--retention` 或加上排程清理；縮小日志等級或過濾範圍。
+
+## 提交與貢獻
+- Commit 標題（繁體中文、祈使句，50 字以內）：
+  - 例如：`加入 logcat 時間戳毫秒降級處理`
+- 內文簡述影響面、風險與驗證步驟；必要時附上日誌片段或 CSV 範例。
+- 開 PR 時請描述：摘要、重現/驗證方式、使用的 adb/裝置設定；若有視覺證據（螢幕擷圖、CSV 範例）更佳。
+
+---
+若你需要我擴充參數說明、補上範例 CSV 欄位、或加入 GitHub Actions/排程腳本，告訴我你的需求與環境即可！

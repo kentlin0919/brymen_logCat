@@ -28,3 +28,13 @@
 ## Log Capture & Device Tips
 - Confirm device time precision upfront: `adb shell 'date "+%Y-%m-%d %H:%M:%S.%3N"'` should yield a full timestamp; if `%N` is unsupported, downgrade to whole milliseconds before running the collector.
 - Monitor disk usage of the output directory, especially when long-running; adjust `--retention` or add cron-based pruning if logs accumulate rapidly.
+
+
+## 回復語言
+- 繁體中文
+
+
+## git
+- 使用繁體中文撰寫commit
+- 自動git push
+
