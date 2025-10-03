@@ -23,7 +23,7 @@ import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional
 
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -35,6 +35,7 @@ DEFAULT_PREFIX = "bt"
 DEFAULT_RETENTION = 36
 DEFAULT_BUGREPORT_COOLDOWN = 900
 DEFAULT_BUGREPORT_DIR = "bugreports"
+COMPACT_WIDTH_BREAKPOINT = 720
 
 
 @dataclass
@@ -124,6 +125,8 @@ class LogCollectorUI(tk.Tk):
         super().__init__()
         self.title("Android Log Collector UI")
         self.geometry("760x520")
+        self.minsize(560, 480)
+        self.columnconfigure(0, weight=1)
 
         # State
         self.devices: List[Device] = []
@@ -131,6 +134,8 @@ class LogCollectorUI(tk.Tk):
         self.reader_thread: Optional[threading.Thread] = None
         self.output_queue: "queue.Queue[str]" = queue.Queue()
         self._stop_reader = threading.Event()
+        self._layout_items: list[tuple[tk.Widget, dict[str, Any], dict[str, Any]]] = []
+        self._current_layout_compact: Optional[bool] = None
 
         # UI variables
         self.selected_device = tk.StringVar()
@@ -144,6 +149,8 @@ class LogCollectorUI(tk.Tk):
 
         # Build widgets
         self._build_widgets()
+        self._apply_layout(False)
+        self.bind("<Configure>", self._on_window_resize)
 
         # Initial load
         self._refresh_adb_path_status()
@@ -156,81 +163,235 @@ class LogCollectorUI(tk.Tk):
     # UI construction
     def _build_widgets(self) -> None:
         pad = {"padx": 8, "pady": 6}
+        self.frame_top = ttk.Frame(self)
+        self.frame_top.pack(fill=tk.X, expand=False, **pad)
 
-        frame_top = ttk.Frame(self)
-        frame_top.pack(fill=tk.X, **pad)
+        def register(widget: tk.Widget, wide_opts: dict[str, Any], compact_opts: dict[str, Any]) -> None:
+            base_pad = {"padx": 4, "pady": 3}
+            wide = {**base_pad, **wide_opts}
+            compact = {**base_pad, **compact_opts}
+            self._layout_items.append((widget, wide, compact))
 
         # ADB path status
-        ttk.Label(frame_top, text="ADB:").grid(row=0, column=0, sticky=tk.W)
-        self.adb_path_lbl = ttk.Label(frame_top, text="檢查中…")
-        self.adb_path_lbl.grid(row=0, column=1, sticky=tk.W, columnspan=3)
+        self.lbl_adb = ttk.Label(self.frame_top, text="ADB:")
+        register(
+            self.lbl_adb,
+            {"row": 0, "column": 0, "sticky": tk.W},
+            {"row": 0, "column": 0, "sticky": tk.W},
+        )
+
+        self.adb_path_lbl = ttk.Label(self.frame_top, text="檢查中…")
+        register(
+            self.adb_path_lbl,
+            {"row": 0, "column": 1, "columnspan": 3, "sticky": tk.W},
+            {"row": 0, "column": 1, "sticky": tk.W},
+        )
 
         # Device selection
-        ttk.Label(frame_top, text="裝置:").grid(row=1, column=0, sticky=tk.W)
-        self.device_combo = ttk.Combobox(
-            frame_top, textvariable=self.selected_device, state="readonly", width=60
+        self.lbl_device = ttk.Label(self.frame_top, text="裝置:")
+        register(
+            self.lbl_device,
+            {"row": 1, "column": 0, "sticky": tk.W},
+            {"row": 1, "column": 0, "sticky": tk.W},
         )
-        self.device_combo.grid(row=1, column=1, sticky=tk.W)
-        ttk.Button(frame_top, text="重新整理", command=self.refresh_devices).grid(
-            row=1, column=2, sticky=tk.W
+
+        self.device_combo = ttk.Combobox(
+            self.frame_top, textvariable=self.selected_device, state="readonly"
+        )
+        register(
+            self.device_combo,
+            {"row": 1, "column": 1, "sticky": tk.EW},
+            {"row": 1, "column": 1, "sticky": tk.EW},
+        )
+
+        self.btn_refresh = ttk.Button(self.frame_top, text="重新整理", command=self.refresh_devices)
+        register(
+            self.btn_refresh,
+            {"row": 1, "column": 2, "sticky": tk.W},
+            {"row": 2, "column": 1, "sticky": tk.E},
         )
 
         # Output directory
-        ttk.Label(frame_top, text="輸出資料夾:").grid(row=2, column=0, sticky=tk.W)
-        self.dir_entry = ttk.Entry(frame_top, textvariable=self.output_dir, width=50)
-        self.dir_entry.grid(row=2, column=1, sticky=tk.W)
-        ttk.Button(frame_top, text="瀏覽…", command=self.browse_dir).grid(
-            row=2, column=2, sticky=tk.W
+        self.lbl_dir = ttk.Label(self.frame_top, text="輸出資料夾:")
+        register(
+            self.lbl_dir,
+            {"row": 2, "column": 0, "sticky": tk.W},
+            {"row": 3, "column": 0, "sticky": tk.W},
+        )
+
+        self.dir_entry = ttk.Entry(self.frame_top, textvariable=self.output_dir)
+        register(
+            self.dir_entry,
+            {"row": 2, "column": 1, "sticky": tk.EW},
+            {"row": 3, "column": 1, "sticky": tk.EW},
+        )
+
+        self.btn_browse_dir = ttk.Button(self.frame_top, text="瀏覽…", command=self.browse_dir)
+        register(
+            self.btn_browse_dir,
+            {"row": 2, "column": 2, "sticky": tk.W},
+            {"row": 4, "column": 1, "sticky": tk.E},
         )
 
         # Prefix & retention
-        ttk.Label(frame_top, text="前綴:").grid(row=3, column=0, sticky=tk.W)
-        ttk.Entry(frame_top, textvariable=self.prefix, width=12).grid(
-            row=3, column=1, sticky=tk.W
+        self.lbl_prefix = ttk.Label(self.frame_top, text="前綴:")
+        register(
+            self.lbl_prefix,
+            {"row": 3, "column": 0, "sticky": tk.W},
+            {"row": 5, "column": 0, "sticky": tk.W},
         )
-        ttk.Label(frame_top, text="保留(小時):").grid(row=3, column=2, sticky=tk.W)
-        ttk.Entry(frame_top, textvariable=self.retention, width=6).grid(
-            row=3, column=3, sticky=tk.W
+
+        self.prefix_entry = ttk.Entry(self.frame_top, textvariable=self.prefix, width=12)
+        register(
+            self.prefix_entry,
+            {"row": 3, "column": 1, "sticky": tk.W},
+            {"row": 5, "column": 1, "sticky": tk.EW},
+        )
+
+        self.lbl_retention = ttk.Label(self.frame_top, text="保留(小時):")
+        register(
+            self.lbl_retention,
+            {"row": 3, "column": 2, "sticky": tk.W},
+            {"row": 6, "column": 0, "sticky": tk.W},
+        )
+
+        self.retention_entry = ttk.Entry(self.frame_top, textvariable=self.retention, width=6)
+        register(
+            self.retention_entry,
+            {"row": 3, "column": 3, "sticky": tk.W},
+            {"row": 6, "column": 1, "sticky": tk.W},
         )
 
         # Bugreport settings
-        ttk.Checkbutton(
-            frame_top, text="啟用 bugreport", variable=self.bugreport_enabled
-        ).grid(row=4, column=0, sticky=tk.W)
-        ttk.Label(frame_top, text="冷卻(秒):").grid(row=4, column=2, sticky=tk.W)
-        ttk.Entry(frame_top, textvariable=self.bugreport_cooldown, width=8).grid(
-            row=4, column=3, sticky=tk.W
+        self.bugreport_check = ttk.Checkbutton(
+            self.frame_top, text="啟用 bugreport", variable=self.bugreport_enabled
         )
-        ttk.Label(frame_top, text="關鍵字(逗號分隔):").grid(row=5, column=0, sticky=tk.W)
-        ttk.Entry(frame_top, textvariable=self.bugreport_keywords, width=50).grid(
-            row=5, column=1, sticky=tk.W, columnspan=2
+        register(
+            self.bugreport_check,
+            {"row": 4, "column": 0, "columnspan": 2, "sticky": tk.W},
+            {"row": 7, "column": 0, "columnspan": 2, "sticky": tk.W},
         )
-        ttk.Label(frame_top, text="Bugreport 目錄:").grid(row=6, column=0, sticky=tk.W)
-        ttk.Entry(frame_top, textvariable=self.bugreport_dir, width=50).grid(
-            row=6, column=1, sticky=tk.W
+
+        self.lbl_cooldown = ttk.Label(self.frame_top, text="冷卻(秒):")
+        register(
+            self.lbl_cooldown,
+            {"row": 4, "column": 2, "sticky": tk.W},
+            {"row": 8, "column": 0, "sticky": tk.W},
         )
-        ttk.Button(frame_top, text="瀏覽…", command=self.browse_bug_dir).grid(
-            row=6, column=2, sticky=tk.W
+
+        self.cooldown_entry = ttk.Entry(
+            self.frame_top, textvariable=self.bugreport_cooldown, width=8
+        )
+        register(
+            self.cooldown_entry,
+            {"row": 4, "column": 3, "sticky": tk.W},
+            {"row": 8, "column": 1, "sticky": tk.W},
+        )
+
+        self.lbl_keywords = ttk.Label(self.frame_top, text="關鍵字(逗號分隔):")
+        register(
+            self.lbl_keywords,
+            {"row": 5, "column": 0, "sticky": tk.W},
+            {"row": 9, "column": 0, "sticky": tk.W},
+        )
+
+        self.keywords_entry = ttk.Entry(
+            self.frame_top, textvariable=self.bugreport_keywords
+        )
+        register(
+            self.keywords_entry,
+            {"row": 5, "column": 1, "columnspan": 2, "sticky": tk.EW},
+            {"row": 9, "column": 1, "sticky": tk.EW},
+        )
+
+        self.lbl_bugdir = ttk.Label(self.frame_top, text="Bugreport 目錄:")
+        register(
+            self.lbl_bugdir,
+            {"row": 6, "column": 0, "sticky": tk.W},
+            {"row": 10, "column": 0, "sticky": tk.W},
+        )
+
+        self.bugdir_entry = ttk.Entry(self.frame_top, textvariable=self.bugreport_dir)
+        register(
+            self.bugdir_entry,
+            {"row": 6, "column": 1, "sticky": tk.EW},
+            {"row": 10, "column": 1, "sticky": tk.EW},
+        )
+
+        self.btn_browse_bugdir = ttk.Button(
+            self.frame_top, text="瀏覽…", command=self.browse_bug_dir
+        )
+        register(
+            self.btn_browse_bugdir,
+            {"row": 6, "column": 2, "sticky": tk.W},
+            {"row": 11, "column": 1, "sticky": tk.E},
         )
 
         # Start/Stop buttons
-        frame_btn = ttk.Frame(self)
-        frame_btn.pack(fill=tk.X, **pad)
-        self.start_btn = ttk.Button(frame_btn, text="開始", command=self.start_collection)
-        self.start_btn.pack(side=tk.LEFT)
+        self.frame_btn = ttk.Frame(self)
+        self.frame_btn.pack(fill=tk.X, expand=False, **pad)
+        self.frame_btn.columnconfigure(0, weight=0)
+        self.frame_btn.columnconfigure(1, weight=0)
+        self.frame_btn.columnconfigure(2, weight=1)
+
+        self.start_btn = ttk.Button(self.frame_btn, text="開始", command=self.start_collection)
+        self.start_btn.grid(row=0, column=0, sticky=tk.W, padx=(0, 8), pady=4)
+
         self.stop_btn = ttk.Button(
-            frame_btn, text="停止", command=self.stop_collection, state=tk.DISABLED
+            self.frame_btn, text="停止", command=self.stop_collection, state=tk.DISABLED
         )
-        self.stop_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.stop_btn.grid(row=0, column=1, sticky=tk.W, pady=4)
 
         # Log output
-        frame_log = ttk.LabelFrame(self, text="輸出")
-        frame_log.pack(fill=tk.BOTH, expand=True, **pad)
-        self.text = tk.Text(frame_log, height=20, wrap=tk.NONE)
-        self.text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        yscroll = ttk.Scrollbar(frame_log, orient=tk.VERTICAL, command=self.text.yview)
-        yscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.frame_log = ttk.LabelFrame(self, text="輸出")
+        self.frame_log.pack(fill=tk.BOTH, expand=True, **pad)
+        self.frame_log.columnconfigure(0, weight=1)
+        self.frame_log.rowconfigure(0, weight=1)
+
+        self.text = tk.Text(self.frame_log, height=20, wrap=tk.NONE)
+        self.text.grid(row=0, column=0, sticky=tk.NSEW)
+
+        yscroll = ttk.Scrollbar(self.frame_log, orient=tk.VERTICAL, command=self.text.yview)
+        yscroll.grid(row=0, column=1, sticky=tk.NS)
         self.text.configure(yscrollcommand=yscroll.set)
+
+    def _apply_layout(self, compact: bool) -> None:
+        if not self._layout_items:
+            return
+        if self._current_layout_compact is not None and compact == self._current_layout_compact:
+            return
+
+        self._current_layout_compact = compact
+
+        for widget, _, _ in self._layout_items:
+            widget.grid_forget()
+
+        # reset column weights
+        for idx in range(4):
+            self.frame_top.columnconfigure(idx, weight=0)
+
+        if compact:
+            for widget, _, compact_opts in self._layout_items:
+                widget.grid(**compact_opts)
+            self.frame_top.columnconfigure(0, weight=0)
+            self.frame_top.columnconfigure(1, weight=1)
+            wrap = max(self.winfo_width() - 160, 260)
+            self.adb_path_lbl.configure(wraplength=wrap)
+        else:
+            for widget, wide_opts, _ in self._layout_items:
+                widget.grid(**wide_opts)
+            self.frame_top.columnconfigure(0, weight=0)
+            self.frame_top.columnconfigure(1, weight=1)
+            self.frame_top.columnconfigure(2, weight=0)
+            self.frame_top.columnconfigure(3, weight=0)
+            self.adb_path_lbl.configure(wraplength=0)
+
+        self.frame_top.update_idletasks()
+
+    def _on_window_resize(self, event: tk.Event[Any]) -> None:
+        if event.widget is not self:
+            return
+        self._apply_layout(event.width < COMPACT_WIDTH_BREAKPOINT)
 
     def _refresh_adb_path_status(self) -> None:
         adb_path = which(ADB_EXE)
