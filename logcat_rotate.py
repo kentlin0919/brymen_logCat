@@ -268,11 +268,34 @@ def run(args):
     if getattr(args, "bugreport_ui", False):
         bugreport_ui_thread = BugreportCLIControl(bugreport_controller)
         bugreport_ui_thread.start()
-    bug_dir = out_dir / "bugreports"
+    # bugreport output directory: absolute path as-is; relative to out_dir otherwise
+    try:
+        br_dir_arg = getattr(args, "bugreport_dir", "bugreports") or "bugreports"
+    except Exception:
+        br_dir_arg = "bugreports"
+    bug_dir = Path(br_dir_arg)
+    if not bug_dir.is_absolute():
+        bug_dir = out_dir / bug_dir
     bug_dir.mkdir(parents=True, exist_ok=True)
     last_bugreport_time = 0.0
     bugreport_lock = threading.Lock()
     bugreport_running = {"flag": False}
+
+    # Configure custom bugreport keywords
+    custom_keywords = []
+    try:
+        raw_list = getattr(args, "bugreport_keyword", []) or []
+        for item in raw_list:
+            if not item:
+                continue
+            # Support comma/semicolon separated input
+            parts = re.split(r"[;,\n]+", str(item))
+            for p in parts:
+                kw = p.strip().lower()
+                if kw:
+                    custom_keywords.append(kw)
+    except Exception:
+        custom_keywords = []
 
     # Original generic BT issue detector (additive; not changing other logic)
     def should_trigger_bt_issue(rec: dict, raw_line: str) -> bool:
@@ -344,14 +367,29 @@ def run(args):
             pass
         return False
 
-    def trigger_bugreport_async():
+    def _sanitize_reason(reason: str) -> str:
+        # keep simple, filename-safe tokens
+        safe = []
+        for ch in reason.lower():
+            if ch.isalnum():
+                safe.append(ch)
+            elif ch in {'.', '-', '_'}:
+                safe.append(ch)
+            else:
+                safe.append('-')
+        # collapse repeats
+        out = re.sub(r"-+", "-", ''.join(safe)).strip('-')
+        return out[:64] if out else "reason"
+
+    def trigger_bugreport_async(reason: str | None = None):
         nonlocal last_bugreport_time
         with bugreport_lock:
             if bugreport_running["flag"]:
                 return
             bugreport_running["flag"] = True
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        out_path = bug_dir / f"bugreport_{ts}.zip"
+        suffix = f"_{_sanitize_reason(reason)}" if reason else ""
+        out_path = bug_dir / f"bugreport_{ts}{suffix}.zip"
         print(f"[info] trigger bugreport -> {out_path}", file=sys.stderr)
 
         def _run():
@@ -373,6 +411,41 @@ def run(args):
                 print(f"[warn] bugreport failed: {e}", file=sys.stderr)
             finally:
                 bugreport_running["flag"] = False
+
+    # --- Crash detection helpers ---
+    FATAL_RE = re.compile(r"FATAL EXCEPTION:\s*([^\s]+)")
+    PROCESS_RE = re.compile(r"Process:\s*([^,\s]+)")
+    FATAL_SIGNAL_RE = re.compile(r"Fatal signal\s+\d+\s+\(([^)]+)\)")
+    NATIVE_PKG_TAIL_RE = re.compile(r"\(([^)]+)\)\s*$")
+
+    def _extract_crash_reason(rec: dict, raw_line: str, prev_rec: dict | None, prev_line: str | None) -> str | None:
+        try:
+            tag = (rec.get("tag") or "").strip()
+            msg = rec.get("message") or ""
+            # Java crash header
+            if tag == "AndroidRuntime" and "FATAL EXCEPTION" in msg:
+                m = FATAL_RE.search(msg)
+                thread = m.group(1) if m else "unknown"
+                return f"crash_fatal_exception_{thread}"
+            # Java crash "Process:" line following header
+            if tag == "AndroidRuntime" and msg.startswith("Process:") and prev_line:
+                if prev_rec and prev_rec.get("tag") == "AndroidRuntime" and "FATAL EXCEPTION" in (prev_rec.get("message") or ""):
+                    mthread = FATAL_RE.search(prev_rec.get("message") or "")
+                    thread = mthread.group(1) if mthread else "unknown"
+                    mpkg = PROCESS_RE.search(msg)
+                    pkg = mpkg.group(1) if mpkg else "app"
+                    return f"crash_fatal_exception_{thread}_{pkg}"
+            # Native crash
+            if tag == "libc" and "Fatal signal" in msg:
+                msig = FATAL_SIGNAL_RE.search(msg)
+                sig = msig.group(1) if msig else "signal"
+                # try to capture package at end: ... pid 1234 (com.app)
+                mpkg = NATIVE_PKG_TAIL_RE.search(msg)
+                pkg = mpkg.group(1) if mpkg else "app"
+                return f"crash_{sig}_{pkg}"
+        except Exception:
+            pass
+        return None
 
         t = threading.Thread(target=_run, daemon=True)
         t.start()
@@ -473,6 +546,29 @@ def run(args):
                 except Exception:
                     pass
             
+            # App crash trigger (Java or native). Include reason in filename
+            if bug_enabled:
+                try:
+                    reason = _extract_crash_reason(rec, line, prev_rec, prev_line)
+                    if reason:
+                        now_t = time.time()
+                        if now_t - last_bugreport_time >= args.bugreport_cooldown:
+                            trigger_bugreport_async(reason)
+                except Exception:
+                    pass
+
+            # Custom keyword trigger
+            if bug_enabled and custom_keywords:
+                try:
+                    low = (line or "").lower()
+                    hit = next((k for k in custom_keywords if k in low), None)
+                    if hit is not None:
+                        now_t = time.time()
+                        if now_t - last_bugreport_time >= args.bugreport_cooldown:
+                            trigger_bugreport_async(f"kw_{hit}")
+                except Exception:
+                    pass
+
             # Also keep original generic BT error trigger
             if bug_enabled:
                 try:
@@ -499,6 +595,17 @@ def main():
     parser.add_argument("--retention", type=int, default=36, help="Retention hours for logs (default: 36)")
     parser.add_argument("--no-bugreport", action="store_true", help="Disable automatic bugreport trigger")
     parser.add_argument("--bugreport-cooldown", type=int, default=900, help="Cooldown seconds between bugreports (default: 900)")
+    parser.add_argument(
+        "--bugreport-dir",
+        default="bugreports",
+        help="Bugreport output directory (absolute or relative to --dir; default: bugreports)",
+    )
+    parser.add_argument(
+        "--bugreport-keyword",
+        action="append",
+        help="Keyword(s) that trigger a bugreport when seen (repeatable, supports comma-separated)",
+        default=[],
+    )
     parser.add_argument(
         "--bugreport-ui",
         action="store_true",

@@ -1,5 +1,6 @@
 param(
-  [string]$Subject = "新增 tkinter UI：裝置選擇與收集控制"
+  [string]$Subject = "新增：bugreport 開關、關鍵字觸發與輸出路徑；UI 支援設定",
+  [string]$Body = ""
 )
 
 function ExitOnError($msg) {
@@ -25,12 +26,25 @@ $hasStaged = ($LASTEXITCODE -ne 0)
 if (-not $hasStaged) {
   Write-Host "沒有變更需要提交。" -ForegroundColor Yellow
 } else {
-  $Body = @(
-    "新增 `log_ui.py` 介面（選擇 adb 裝置、輸出資料夾、前綴與保留小時）",
-    "以 ANDROID_SERIAL 指派裝置，無需改動既有 `logcat_rotate.py`",
-    "子程序串流 stdout/stderr 至 UI，提供開始/停止控制",
-    "驗證：python log_ui.py 啟動 UI、選裝置後開始收集"
-  ) -join [Environment]::NewLine
+  if ([string]::IsNullOrWhiteSpace($Body)) {
+    $Body = @(
+      "logcat_rotate.py：",
+      "- 新增 app crash 偵測觸發 bugreport（Java 與 native）",
+      "- 支援 --bugreport-keyword（可重複、逗號/分號/換行分隔）",
+      "- 新增 --bugreport-dir（支援相對/絕對路徑）",
+      "- ZIP 檔名加入原因，例如 kw_timeout、crash_sigsegv_com.app",
+      "- 保留既有 BT/GATT 條件與冷卻機制",
+      "",
+      "log_ui.py：",
+      "- 新增 bugreport 開關、冷卻(秒)、自訂關鍵字欄位",
+      "- 新增 Bugreport 目錄欄位與瀏覽按鈕",
+      "- 以 ANDROID_SERIAL 指派裝置，串流輸出至 UI",
+      "",
+      "驗證：",
+      "- python log_ui.py 啟動 UI，設定關鍵字與目錄後開始收集",
+      "- 或 CLI：python logcat_rotate.py --dir ./logs --bugreport-dir bugreports_bt --bugreport-keyword ANR,timeout"
+    ) -join [Environment]::NewLine
+  }
 
   git commit -m $Subject -m $Body
   if ($LASTEXITCODE -ne 0) { ExitOnError "git commit 失敗。" }
@@ -50,4 +64,3 @@ if ($LASTEXITCODE -ne 0) {
 if ($LASTEXITCODE -ne 0) { ExitOnError "git push 失敗。" }
 
 Write-Host "提交與推送完成 (分支: $branch)" -ForegroundColor Green
-

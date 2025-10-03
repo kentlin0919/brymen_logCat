@@ -33,6 +33,8 @@ from tkinter import ttk
 ADB_EXE = "adb"
 DEFAULT_PREFIX = "bt"
 DEFAULT_RETENTION = 36
+DEFAULT_BUGREPORT_COOLDOWN = 900
+DEFAULT_BUGREPORT_DIR = "bugreports"
 
 
 @dataclass
@@ -135,6 +137,10 @@ class LogCollectorUI(tk.Tk):
         self.output_dir = tk.StringVar(value=str(Path.cwd() / "logs"))
         self.prefix = tk.StringVar(value=DEFAULT_PREFIX)
         self.retention = tk.StringVar(value=str(DEFAULT_RETENTION))
+        self.bugreport_enabled = tk.BooleanVar(value=True)
+        self.bugreport_cooldown = tk.StringVar(value=str(DEFAULT_BUGREPORT_COOLDOWN))
+        self.bugreport_keywords = tk.StringVar(value="")
+        self.bugreport_dir = tk.StringVar(value=DEFAULT_BUGREPORT_DIR)
 
         # Build widgets
         self._build_widgets()
@@ -187,6 +193,26 @@ class LogCollectorUI(tk.Tk):
             row=3, column=3, sticky=tk.W
         )
 
+        # Bugreport settings
+        ttk.Checkbutton(
+            frame_top, text="啟用 bugreport", variable=self.bugreport_enabled
+        ).grid(row=4, column=0, sticky=tk.W)
+        ttk.Label(frame_top, text="冷卻(秒):").grid(row=4, column=2, sticky=tk.W)
+        ttk.Entry(frame_top, textvariable=self.bugreport_cooldown, width=8).grid(
+            row=4, column=3, sticky=tk.W
+        )
+        ttk.Label(frame_top, text="關鍵字(逗號分隔):").grid(row=5, column=0, sticky=tk.W)
+        ttk.Entry(frame_top, textvariable=self.bugreport_keywords, width=50).grid(
+            row=5, column=1, sticky=tk.W, columnspan=2
+        )
+        ttk.Label(frame_top, text="Bugreport 目錄:").grid(row=6, column=0, sticky=tk.W)
+        ttk.Entry(frame_top, textvariable=self.bugreport_dir, width=50).grid(
+            row=6, column=1, sticky=tk.W
+        )
+        ttk.Button(frame_top, text="瀏覽…", command=self.browse_bug_dir).grid(
+            row=6, column=2, sticky=tk.W
+        )
+
         # Start/Stop buttons
         frame_btn = ttk.Frame(self)
         frame_btn.pack(fill=tk.X, **pad)
@@ -218,6 +244,25 @@ class LogCollectorUI(tk.Tk):
         sel = filedialog.askdirectory(title="選擇輸出資料夾", initialdir=self.output_dir.get())
         if sel:
             self.output_dir.set(sel)
+
+    def browse_bug_dir(self) -> None:
+        base = self.output_dir.get() or str(Path.cwd() / "logs")
+        sel = filedialog.askdirectory(title="選擇 Bugreport 目錄", initialdir=base)
+        if sel:
+            # allow absolute path; if under output_dir, store relative for neatness
+            try:
+                out = Path(self.output_dir.get()).resolve()
+                p = Path(sel).resolve()
+                if str(p).startswith(str(out)):
+                    try:
+                        rel = p.relative_to(out)
+                        self.bugreport_dir.set(str(rel))
+                        return
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            self.bugreport_dir.set(sel)
 
     def refresh_devices(self) -> None:
         devices = list_adb_devices()
@@ -283,6 +328,18 @@ class LogCollectorUI(tk.Tk):
             messagebox.showwarning("提示", "保留小時必須為正整數。")
             return
 
+        # Validate bugreport cooldown if enabled
+        bug_enabled = bool(self.bugreport_enabled.get())
+        cooldown_int = DEFAULT_BUGREPORT_COOLDOWN
+        if bug_enabled:
+            try:
+                cooldown_int = int(self.bugreport_cooldown.get())
+                if cooldown_int < 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showwarning("提示", "冷卻(秒)必須為 0 或正整數。")
+                return
+
         prefix = self.prefix.get().strip() or DEFAULT_PREFIX
 
         # Prepare command
@@ -302,11 +359,28 @@ class LogCollectorUI(tk.Tk):
             str(retention_int),
         ]
 
+        # Bugreport flags
+        if not bug_enabled:
+            cmd.append("--no-bugreport")
+        else:
+            cmd += ["--bugreport-cooldown", str(cooldown_int)]
+            # split keywords by comma/semicolon/newline and pass individually
+            raw_kw = self.bugreport_keywords.get()
+            if raw_kw:
+                import re as _re
+                for token in _re.split(r"[;,\n]+", raw_kw):
+                    kw = token.strip()
+                    if kw:
+                        cmd += ["--bugreport-keyword", kw]
+            # bugreport directory (absolute or relative to --dir)
+            brd = self.bugreport_dir.get().strip() or DEFAULT_BUGREPORT_DIR
+            cmd += ["--bugreport-dir", brd]
+
         env = os.environ.copy()
         env["ANDROID_SERIAL"] = serial
 
         self._append_log(
-            f"啟動收集: 裝置={serial}, 目錄={out_dir}, 前綴={prefix}, 保留={retention_int}h\n"
+            f"啟動收集: 裝置={serial}, 目錄={out_dir}, 前綴={prefix}, 保留={retention_int}h, bugreport={'開' if bug_enabled else '關'}, 冷卻={cooldown_int}s, bug目錄={self.bugreport_dir.get().strip() or DEFAULT_BUGREPORT_DIR}\n"
         )
 
         try:
@@ -403,4 +477,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
