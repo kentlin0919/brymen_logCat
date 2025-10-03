@@ -7,7 +7,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -39,6 +39,36 @@ BT_KEYWORDS = [
 ]
 
 GATT_CONGESTION_STATUS_RE = re.compile(r"status\s*[:=]\s*(142|0x8e)", re.IGNORECASE)
+
+
+LOGCAT_SINCE_SUPPORT: bool | None = None
+
+
+def _ensure_logcat_since_support() -> bool:
+    global LOGCAT_SINCE_SUPPORT
+    if LOGCAT_SINCE_SUPPORT is not None:
+        return LOGCAT_SINCE_SUPPORT
+    try:
+        result = subprocess.run(
+            ["adb", "logcat", "-v", "threadtime", "-T", "1", "-d"],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            check=False,
+        )
+        combined = (result.stdout or "") + (result.stderr or "")
+        lowered = combined.lower()
+        if "invalid option" in lowered or "unrecognized option" in lowered:
+            LOGCAT_SINCE_SUPPORT = False
+            return LOGCAT_SINCE_SUPPORT
+        LOGCAT_SINCE_SUPPORT = True
+        return LOGCAT_SINCE_SUPPORT
+    except subprocess.TimeoutExpired:
+        LOGCAT_SINCE_SUPPORT = True
+    except Exception:
+        LOGCAT_SINCE_SUPPORT = True
+    return LOGCAT_SINCE_SUPPORT
 
 
 class BugreportController:
@@ -232,8 +262,11 @@ def cleanup_old_logs_loop(stop_event: threading.Event, directory: Path, retentio
             pass
 
 
-def build_logcat_cmd_from_now():
+def build_logcat_cmd_from_now() -> tuple[list[str], datetime | None]:
     base = ["adb", "logcat", "-v", "threadtime"]
+    if not _ensure_logcat_since_support():
+        print("[warn] 目標裝置 logcat 不支援 -T 參數，將從目前時間開始過濾舊紀錄", file=sys.stderr)
+        return base, datetime.now() - timedelta(seconds=1)
     try:
         ts = subprocess.check_output(
             ["adb", "shell", 'date "+%Y-%m-%d %H:%M:%S.%3N"'],
@@ -244,10 +277,10 @@ def build_logcat_cmd_from_now():
             ts = ts.replace("\r", "")
             if "%3N" in ts or "%N" in ts:
                 ts = ts.replace("%3N", "000").replace("%N", "000000000")
-            return base + ["-T", ts]
+            return base + ["-T", ts], None
     except Exception:
         pass
-    return base + ["-T", "1"]
+    return base + ["-T", "1"], None
 
 
 def run(args):
@@ -471,9 +504,11 @@ def run(args):
     if os.name == "nt":
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+    logcat_cmd, skip_before_ts = build_logcat_cmd_from_now()
+
     try:
         proc = subprocess.Popen(
-            build_logcat_cmd_from_now(),
+            logcat_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=1,
@@ -506,6 +541,9 @@ def run(args):
                     "tag": "",
                     "message": line.strip(),
                 }
+
+            if skip_before_ts and rec["timestamp"] < skip_before_ts:
+                continue
 
             bug_enabled = bugreport_controller.is_enabled()
 
